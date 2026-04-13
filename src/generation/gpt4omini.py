@@ -12,15 +12,25 @@ client = OpenAI(api_key=api_key)
 
 
 def generate_answer(question, context, model="gpt-4o-mini"):
-    prompt = f"""Answer the question using the provided context only.
-If the answer is not supported by the context, say "I don't know".
+    if isinstance(context, list):
+        context = "\n\n".join(context)
 
-Question: {question}
+    prompt = f"""Answer the question using only the provided context.
 
-Context:
-{context}
+    Rules:
+    - Give the shortest possible answer span.
+    - Do not write a full sentence.
+    - If the context contains the answer, copy it as directly as possible.
+    - Only say "I don't know" if the context truly does not contain the answer.
+    - Return only the minimal answer span.
+    - Do not include extra names, explanations, or surrounding details. 
 
-Answer:"""
+    Question: {question}
+
+    Context:
+    {context}
+
+    Answer:"""
 
     response = client.responses.create(
         model=model,
@@ -31,3 +41,7 @@ Answer:"""
         return response.output_text.strip()
 
     return str(response)
+
+
+def generate(question, context, model="gpt-4o-mini"):
+    return generate_answer(question, context, model=model)

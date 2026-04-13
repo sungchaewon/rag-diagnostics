@@ -25,10 +25,10 @@ def summarize_results(results: list[dict]):
 
 
 def run_all(data_path: str, top_k: int = 10, rerank_top_k: int = 5):
-    os.makedirs("results", exist_ok=True)
+    os.makedirs("outputs", exist_ok=True)
 
     with open(data_path, "r", encoding="utf-8") as f:
-        samples = [json.loads(line) for line in f]
+        samples = [json.loads(line) for line in f][:20] #테스트로 5개만 돌려봄 
 
     results = []
 
@@ -96,11 +96,11 @@ def run_all(data_path: str, top_k: int = 10, rerank_top_k: int = 5):
         })
 
         if (i + 1) % 10 == 0:
-            with open("results/results_checkpoint.json", "w", encoding="utf-8") as f:
+            with open("outputs/results_checkpoint.json", "w", encoding="utf-8") as f:
                 json.dump(results, f, ensure_ascii=False, indent=2)
             print(f"Checkpoint saved at {i+1}")
 
-    with open("results/results.json", "w", encoding="utf-8") as f:
+    with open("outputs/results.json", "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
 
     summarize_results(results)
