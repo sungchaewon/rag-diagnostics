@@ -28,7 +28,7 @@ def run_all(data_path: str, top_k: int = 10, rerank_top_k: int = 5):
     os.makedirs("outputs", exist_ok=True)
 
     with open(data_path, "r", encoding="utf-8") as f:
-        samples = [json.loads(line) for line in f][:20] #테스트로 5개만 돌려봄 
+        samples = [json.loads(line) for line in f]
 
     results = []
 
@@ -85,6 +85,7 @@ def run_all(data_path: str, top_k: int = 10, rerank_top_k: int = 5):
         results.append({
             "id": sample.get("id", i),
             "question": q,
+            "question_type": sample.get("question_type", "other"),
             "golden_answers": gold_answers,
             "golden_passage": gold_passage,
             "split_answer_type": sample.get("split_answer_type", "unknown"),
@@ -107,4 +108,4 @@ def run_all(data_path: str, top_k: int = 10, rerank_top_k: int = 5):
 
 
 if __name__ == "__main__":
-    run_all("data/nq_sample/nq_100.jsonl")
+    run_all("data/nq_sample/nq_500_labeled.jsonl")

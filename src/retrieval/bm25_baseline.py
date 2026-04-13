@@ -1,7 +1,7 @@
 import json
 from rank_bm25 import BM25Okapi
 
-CORPUS_PATH = "data/corpus/nq_passage_corpus.jsonl"
+CORPUS_PATH = "data/corpus/nq_passage_corpus_500.jsonl"
 
 _passages = None
 _bm25 = None
