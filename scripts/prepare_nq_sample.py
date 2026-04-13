@@ -1,46 +1,54 @@
-from datasets import load_dataset
 import json
 import os
+from datasets import load_dataset
 
-dataset = load_dataset("natural_questions", split="validation", streaming=True)
 
-samples = []
-for item in dataset:
-    short_answers = item["annotations"]["short_answers"]
-    if not short_answers or not short_answers[0]["text"]:
-        continue
+def main():
+    dataset = load_dataset("natural_questions", split="validation", streaming=True)
 
-    answer = short_answers[0]["text"][0]
-    question = item["question"]["text"]
+    samples = []
+    for item in dataset:
+        short_answers = item["annotations"]["short_answers"]
+        if not short_answers or not short_answers[0]["text"]:
+            continue
 
-    doc_tokens = item["document"]["tokens"]
-    start = short_answers[0]["start_token"][0]
-    end = short_answers[0]["end_token"][0]
+        answer = short_answers[0]["text"][0]
+        question = item["question"]["text"]
 
-    golden_passage = " ".join(
-        [
-            t for t, is_html in zip(
-                doc_tokens["token"][max(0, start - 50): end + 50],
-                doc_tokens["is_html"][max(0, start - 50): end + 50]
-            )
-            if not is_html
-        ]
-    )
+        doc_tokens = item["document"]["tokens"]
+        start = short_answers[0]["start_token"][0]
+        end = short_answers[0]["end_token"][0]
 
-    samples.append({
-        "id": item["id"],
-        "question": question,
-        "golden_answers": [answer],
-        "golden_passage": golden_passage
-    })
+        golden_passage = " ".join(
+            [
+                t for t, is_html in zip(
+                    doc_tokens["token"][max(0, start - 50): end + 50],
+                    doc_tokens["is_html"][max(0, start - 50): end + 50]
+                )
+                if not is_html
+            ]
+        )
 
-    if len(samples) >= 100:
-        break
+        samples.append({
+            "id": item["id"],
+            "question": question,
+            "golden_answers": [answer],
+            "golden_passage": golden_passage,
+            "split_answer_type": "unknown",
+            "split_retrieval": "unknown"
+        })
 
-os.makedirs("data/nq_sample", exist_ok=True)
+        if len(samples) >= 100:
+            break
 
-with open("data/nq_sample/nq_100.jsonl", "w", encoding="utf-8") as f:
-    for s in samples:
-        f.write(json.dumps(s, ensure_ascii=False) + "\n")
+    os.makedirs("data/nq_sample", exist_ok=True)
 
-print(f"Saved {len(samples)} samples")
+    with open("data/nq_sample/nq_100.jsonl", "w", encoding="utf-8") as f:
+        for s in samples:
+            f.write(json.dumps(s, ensure_ascii=False) + "\n")
+
+    print(f"Saved {len(samples)} samples to data/nq_sample/nq_100.jsonl")
+
+
+if __name__ == "__main__":
+    main()
