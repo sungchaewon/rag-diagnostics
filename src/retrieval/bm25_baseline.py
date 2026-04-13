@@ -1,34 +1,40 @@
+import json
 from rank_bm25 import BM25Okapi
 
+CORPUS_PATH = "data/corpus/nq_passage_corpus.jsonl"
 
-def retrieve_top_k(question, corpus, k=3):
-    """
-    BM25 baseline retrieval.
-    Returns top-k documents with scores.
-    """
-    tokenized_corpus = [doc.lower().split() for doc in corpus]
-    bm25 = BM25Okapi(tokenized_corpus)
+_passages = None
+_bm25 = None
 
-    scores = bm25.get_scores(question.lower().split())
+
+def _load_corpus():
+    global _passages, _bm25
+
+    if _passages is not None and _bm25 is not None:
+        return
+
+    passages = []
+    with open(CORPUS_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            item = json.loads(line)
+            passages.append(item["contents"])
+
+    tokenized_corpus = [p.lower().split() for p in passages]
+
+    _passages = passages
+    _bm25 = BM25Okapi(tokenized_corpus)
+
+
+def retrieve_bm25(query: str, top_k: int = 10) -> list[str]:
+    _load_corpus()
+
+    query_tokens = query.lower().split()
+    scores = _bm25.get_scores(query_tokens)
 
     ranked = sorted(
-        [{"doc": doc, "score": float(score)} for doc, score in zip(corpus, scores)],
-        key=lambda x: x["score"],
-        reverse=True,
+        zip(scores, _passages),
+        key=lambda x: x[0],
+        reverse=True
     )
-    return ranked[:k]
 
-def retrieve_oracle_r(query: str, 
-                      golden_passage: str, 
-                      top_k: int = 10) -> list[str]:
-    """
-    Oracle-R: BM25 결과에 golden passage를 강제로 포함
-    golden passage를 첫 번째로 넣고 나머지를 BM25 결과로 채움
-    """
-    # BM25로 top_k 검색
-    bm25_results = retrieve_bm25(query, top_k=top_k-1)
-    
-    # golden passage를 맨 앞에 강제 삽입
-    oracle_results = [golden_passage] + bm25_results
-    
-    return oracle_results
+    return [passage for _, passage in ranked[:top_k]]
