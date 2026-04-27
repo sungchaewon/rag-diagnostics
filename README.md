@@ -10,7 +10,7 @@ Retrieval-Augmented Generation (RAG) systems commonly consist of multiple stages
 
 This project investigates a modular RAG pipeline through oracle-based interventions. By injecting gold evidence at different stages, we analyze how much each component affects final answer quality. In addition to average oracle gains, we further examine subset-level results by retrieval outcome and question type to reveal hidden bottlenecks that may be obscured by aggregate performance.
 
-![Oracle-based diagnosis overview](figures/intro3.png)
+![Oracle-based diagnosis overview](figures.png)
 
 ## Experimental Setting
 
