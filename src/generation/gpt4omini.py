@@ -35,6 +35,7 @@ def generate_answer(question, context, model="gpt-4o-mini"):
     response = client.responses.create(
         model=model,
         input=prompt,
+        temperature=0,
     )
 
     if hasattr(response, "output_text") and response.output_text:
@@ -45,3 +46,11 @@ def generate_answer(question, context, model="gpt-4o-mini"):
 
 def generate(question, context, model="gpt-4o-mini"):
     return generate_answer(question, context, model=model)
+
+def gpt(prompt, model="gpt-4o-mini"):
+    response = client.responses.create(
+        model=model,
+        input=prompt,
+        temperature=0,
+    )
+    return response.output_text.strip()

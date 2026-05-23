@@ -1,5 +1,6 @@
 import json
 import argparse
+from pathlib import Path
 
 from src.retrieval.bm25_baseline import retrieve_bm25
 from src.generation.gpt4omini import generate
@@ -31,14 +32,36 @@ def get_gold_answers(sample):
     return gold
 
 
-def run_repair_experiments(data_path, output_path, n_samples=None):
+
+def load_done(output_path):
+    p = Path(output_path)
+    if not p.exists():
+        return []
+    try:
+        data = json.load(open(p))
+        if isinstance(data, list):
+            return data
+    except Exception:
+        return []
+    return []
+
+
+def save_results(output_path, results):
+    p = Path(output_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "w") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+
+
+def run_repair_experiments(data_path, output_path, n_samples=None, resume=True):
     with open(data_path) as f:
         samples = [json.loads(l) for l in f]
 
     if n_samples:
         samples = samples[:n_samples]
 
-    results = []
+    results = load_done(output_path) if resume else []
+    start = len(results)
 
     class SimpleRetriever:
         def retrieve(self, query, top_k=10):
@@ -52,7 +75,11 @@ def run_repair_experiments(data_path, output_path, n_samples=None):
     retriever = SimpleRetriever()
     generator = SimpleGenerator()
 
-    for i, sample in enumerate(samples):
+    if start > 0:
+        print(f"Resume from {start}/{len(samples)}", flush=True)
+
+    for i in range(start, len(samples)):
+        sample = samples[i]
         q = sample["question"]
         gold_ans = get_gold_answers(sample)
 
@@ -60,7 +87,7 @@ def run_repair_experiments(data_path, output_path, n_samples=None):
         question_type = sample.get("question_type", "other")
         best_oracle = sample.get("best_oracle_stage", "baseline")
 
-        print(f"[{i+1}/{len(samples)}] {q[:50]}...")
+        print(f"[{i+1}/{len(samples)}] {q[:50]}...", flush=True)
 
         # 1. Baseline
         baseline_contexts = retriever.retrieve(q, top_k=10)
@@ -110,13 +137,11 @@ def run_repair_experiments(data_path, output_path, n_samples=None):
 
         results.append(result)
 
-        if (i + 1) % 10 == 0:
-            with open(output_path, "w") as f:
-                json.dump(results, f, indent=2, ensure_ascii=False)
+        if (i + 1) % 100 == 0:
+            save_results(output_path, results)
             print(f"Checkpoint saved at {i+1}")
 
-    with open(output_path, "w") as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
+    save_results(output_path, results)
 
     print_summary(results)
 
@@ -133,6 +158,7 @@ if __name__ == "__main__":
     parser.add_argument("--data", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--n_samples", type=int, default=None)
+    parser.add_argument("--no_resume", action="store_true")
     args = parser.parse_args()
 
-    run_repair_experiments(args.data, args.output, args.n_samples)
+    run_repair_experiments(args.data, args.output, args.n_samples, resume=not args.no_resume)

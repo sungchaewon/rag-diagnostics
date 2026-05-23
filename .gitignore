@@ -5,3 +5,6 @@ __pycache__/
 .vscode/
 data/
 outputs/
+
+logs/
+*.bak
