@@ -116,11 +116,3 @@ rag-diagnostics/
 │   └── retrieval/
 └── README.md
 ```
-
-## Current Status
-
-This repository currently supports the initial experimental setup for the KDD UC version of the study. The main focus is on validating stage-wise oracle interventions, analyzing split-level bottlenecks, and preparing results for paper writing.
-
-## Notes
-
-This project is intended for research and diagnostic analysis rather than deployment. Experimental results may vary depending on dataset sampling, corpus construction, retrieval depth, reranking configuration, and generation settings.
