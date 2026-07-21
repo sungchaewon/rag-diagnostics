@@ -15,9 +15,33 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from router_common import load_action_scores
 
-NUMERIC = ["is_unknown", "answer_len", "ctx_overlap", "is_numeric_q",
-           "ans_has_digit", "bm25_top1", "bm25_margin", "bm25_mean10"]
-CATEG = ["qtype"]
+BASE_NUMERIC = ["is_unknown", "answer_len", "ctx_overlap", "is_numeric_q",
+                "ans_has_digit", "bm25_top1", "bm25_margin", "bm25_mean10"]
+BASE_CATEG = ["qtype"]
+
+# diagnostic features (present only after join_diagnostic_features.py)
+DIAG_NUMERIC = ["bm25_hit", "gold_rank_capped"]
+DIAG_CATEG = ["rank_bucket", "split_retrieval", "split_answer_type"]
+
+# populated by configure_features()
+NUMERIC = list(BASE_NUMERIC)
+CATEG = list(BASE_CATEG)
+
+
+def configure_features(df, use_diag):
+    """Set the active feature set; returns a label describing it."""
+    global NUMERIC, CATEG
+    NUMERIC, CATEG = list(BASE_NUMERIC), list(BASE_CATEG)
+    if not use_diag:
+        return "surface-only"
+    have = [c for c in DIAG_NUMERIC + DIAG_CATEG if c in df.columns]
+    if not have:
+        print("[train_router] --use_diag set but no diagnostic columns found; "
+              "run join_diagnostic_features.py first. Falling back.")
+        return "surface-only"
+    NUMERIC += [c for c in DIAG_NUMERIC if c in df.columns]
+    CATEG += [c for c in DIAG_CATEG if c in df.columns]
+    return f"surface+diagnostic ({', '.join(have)})"
 SELECTOR_ACTIONS = ["retrieval_repair", "generation_repair_v2",
                     "generation_repair_v3"]
 THRESHOLDS = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
@@ -32,7 +56,7 @@ def load_features(path):
         df["qid"] = df.index.astype(str)
         id_col = "qid"
     df[id_col] = df[id_col].astype(str)
-    missing = [c for c in NUMERIC + CATEG + ["best_action"]
+    missing = [c for c in BASE_NUMERIC + BASE_CATEG + ["best_action"]
                if c not in df.columns]
     if missing:
         sys.exit(f"[train_router] missing columns in {path}: {missing}")
@@ -175,9 +199,12 @@ def main(args):
     df, id_col = load_features(args.features)
     scores = load_action_scores(args.log)
     tag = Path(args.features).stem
-    results = {"train": tag}
+    feat_label = configure_features(df, args.use_diag)
+    results = {"train": tag, "feature_set": feat_label,
+               "numeric": list(NUMERIC), "categorical": list(CATEG)}
 
     print(f"train features: {args.features} ({len(df)} rows)")
+    print(f"feature set: {feat_label}")
     print(f"best_action distribution: "
           f"{df['best_action'].value_counts().to_dict()}")
 
@@ -234,7 +261,8 @@ def main(args):
 
     out = Path("outputs/arr")
     out.mkdir(parents=True, exist_ok=True)
-    out_path = out / f"router_results_{tag}_{args.model}.json"
+    suffix = "diag" if args.use_diag and "diagnostic" in feat_label else "surface"
+    out_path = out / f"router_results_{tag}_{args.model}_{suffix}.json"
     out_path.write_text(json.dumps(results, indent=2, default=str))
     print(f"\nwrote {out_path}")
 
@@ -246,5 +274,7 @@ if __name__ == "__main__":
     ap.add_argument("--eval_features")
     ap.add_argument("--eval_log")
     ap.add_argument("--model", default="logreg", choices=["logreg", "gbt"])
+    ap.add_argument("--use_diag", action="store_true",
+                    help="include CIKM diagnostic features if present")
     args = ap.parse_args()
     main(args)
