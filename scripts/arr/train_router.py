@@ -44,7 +44,7 @@ def configure_features(df, use_diag):
     return f"surface+diagnostic ({', '.join(have)})"
 SELECTOR_ACTIONS = ["retrieval_repair", "generation_repair_v2",
                     "generation_repair_v3"]
-THRESHOLDS = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+THRESHOLDS = [0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.7, 0.8, 0.9]
 
 
 # ---------------------------------------------------------------- data
@@ -95,9 +95,12 @@ def routed_scores(decisions, scores):
                 fixed += 1
             elif v[a]["em"] < v["baseline"]["em"]:
                 harmed += 1
+    net = fixed - harmed
     return {"em": em / n, "f1": f1 / n, "n": n,
             "repair_rate": repairs / n,
             "fixed": fixed, "harmed": harmed,
+            "net_gain": net,
+            "gain_per_100_repairs": 100.0 * net / repairs if repairs else 0.0,
             "over_repair_rate": (repairs - fixed) / repairs if repairs else 0.0}
 
 
@@ -108,17 +111,33 @@ def two_stage_decide(gate_proba, sel_pred, thr):
 
 
 # ------------------------------------------------- out-of-fold training
-def oof_two_stage(df, id_col, model_kind, seed=0):
+def gate_sample_weights(df, harm_weight):
+    """
+    Harm-aware weighting for the gate. Misclassifying a baseline-success
+    query as repairable is the only path to harm (FIXED/HARMED cross-tab),
+    so those negatives get weight `harm_weight`; everything else weight 1.
+    harm_weight=1.0 reproduces the original unweighted training.
+    """
+    w = np.ones(len(df))
+    if harm_weight != 1.0 and "baseline_em" in df.columns:
+        harm_risk = ((df["best_action"] == "baseline")
+                     & (df["baseline_em"] == 1)).values
+        w[harm_risk] = harm_weight
+    return w
+
+
+def oof_two_stage(df, id_col, model_kind, harm_weight=1.0, seed=0):
     """5-fold OOF gate probabilities + selector predictions."""
     X = df[NUMERIC + CATEG]
     y_gate = (df["best_action"] != "baseline").astype(int).values
+    weights = gate_sample_weights(df, harm_weight)
     gate_proba = pd.Series(index=df.index, dtype=float)
     sel_pred = pd.Series(index=df.index, dtype=object)
 
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
     for tr, te in skf.split(X, y_gate):
         gate = make_model(model_kind)
-        gate.fit(X.iloc[tr], y_gate[tr])
+        gate.fit(X.iloc[tr], y_gate[tr], clf__sample_weight=weights[tr])
         gate_proba.iloc[te] = gate.predict_proba(X.iloc[te])[:, 1]
 
         sel_mask = df.iloc[tr]["best_action"].isin(SELECTOR_ACTIONS)
@@ -145,11 +164,13 @@ def oof_one_stage(df, id_col, model_kind, seed=0):
     return dict(zip(df[id_col].values, pred.values))
 
 
-def fit_full(df, model_kind):
+def fit_full(df, model_kind, harm_weight=1.0):
     """Fit gate + selector on the full dataframe (for transfer)."""
     X = df[NUMERIC + CATEG]
+    weights = gate_sample_weights(df, harm_weight)
     gate = make_model(model_kind)
-    gate.fit(X, (df["best_action"] != "baseline").astype(int))
+    gate.fit(X, (df["best_action"] != "baseline").astype(int),
+             clf__sample_weight=weights)
     sel_mask = df["best_action"].isin(SELECTOR_ACTIONS)
     sel = make_model(model_kind)
     sel.fit(X[sel_mask.values], df["best_action"][sel_mask.values])
@@ -176,11 +197,12 @@ def feature_importance(gate, sel):
 # ---------------------------------------------------------------- main
 def report_block(title, rows):
     print(f"\n=== {title} ===")
-    print(f"{'setting':<32}{'EM':>8}{'F1':>8}{'rep%':>7}"
-          f"{'fixed':>7}{'harmed':>7}{'overR%':>8}")
+    print(f"{'setting':<34}{'EM':>8}{'F1':>8}{'rep%':>7}"
+          f"{'fixed':>7}{'harmed':>7}{'net':>6}{'g/100r':>8}{'overR%':>8}")
     for name, r in rows:
-        print(f"{name:<32}{r['em']:>8.4f}{r['f1']:>8.4f}"
+        print(f"{name:<34}{r['em']:>8.4f}{r['f1']:>8.4f}"
               f"{r['repair_rate']:>7.1%}{r['fixed']:>7}{r['harmed']:>7}"
+              f"{r['net_gain']:>6}{r['gain_per_100_repairs']:>8.1f}"
               f"{r['over_repair_rate']:>8.1%}")
 
 
@@ -213,17 +235,23 @@ def main(args):
     report_block("uniform / oracle baselines (train dataset)", rows)
     results["baselines"] = {k: v for k, v in rows}
 
-    # two-stage OOF
-    gate_p, sel_p = oof_two_stage(df, id_col, args.model)
-    sweep = []
-    for thr in THRESHOLDS:
-        dec = two_stage_decide(gate_p, sel_p, thr)
-        sweep.append((f"2-stage thr={thr}", routed_scores(dec, scores)))
-    report_block("two-stage router, 5-fold OOF, gate threshold sweep", sweep)
-    results["two_stage_sweep"] = {k: v for k, v in sweep}
-    best_thr = max(sweep, key=lambda t: t[1]["em"])
-    print(f"\nbest threshold by routed EM: {best_thr[0]} "
-          f"(EM {best_thr[1]['em']:.4f})")
+    # two-stage OOF, harm-weight x threshold sweep
+    harm_weights = [float(x) for x in args.harm_weights.split(",")]
+    best_overall = None
+    results["two_stage"] = {}
+    for hw in harm_weights:
+        gate_p, sel_p = oof_two_stage(df, id_col, args.model, harm_weight=hw)
+        sweep = []
+        for thr in THRESHOLDS:
+            dec = two_stage_decide(gate_p, sel_p, thr)
+            sweep.append((f"hw={hw} thr={thr}", routed_scores(dec, scores)))
+        report_block(f"two-stage router, 5-fold OOF, harm_weight={hw}", sweep)
+        results["two_stage"][f"hw={hw}"] = {k: v for k, v in sweep}
+        top = max(sweep, key=lambda t: t[1]["em"])
+        if best_overall is None or top[1]["em"] > best_overall[1]["em"]:
+            best_overall = top
+    print(f"\nbest overall by routed EM: {best_overall[0]} "
+          f"(EM {best_overall[1]['em']:.4f}, harmed {best_overall[1]['harmed']})")
 
     # one-stage ablation
     one = oof_one_stage(df, id_col, args.model)
@@ -232,7 +260,9 @@ def main(args):
     results["one_stage"] = r1
 
     # feature importance (full fit)
-    gate, sel = fit_full(df, args.model)
+    best_hw = float(best_overall[0].split()[0].split("=")[1])
+    gate, sel = fit_full(df, args.model, harm_weight=best_hw)
+    print(f"\n(full fit uses best harm_weight={best_hw})")
     fi = feature_importance(gate, sel)
     print("\n=== feature importance (top 8, full fit) ===")
     for part, items in fi.items():
@@ -250,14 +280,18 @@ def main(args):
 
         X = edf[NUMERIC + CATEG]
         qids = edf[eid].values
-        gate_pe = dict(zip(qids, gate.predict_proba(X)[:, 1]))
-        sel_pe = dict(zip(qids, sel.predict(X)))
-        tsweep = []
-        for thr in THRESHOLDS:
-            dec = two_stage_decide(gate_pe, sel_pe, thr)
-            tsweep.append((f"transfer thr={thr}", routed_scores(dec, escores)))
-        report_block("cross-dataset transfer (train->eval)", tsweep)
-        results["transfer_sweep"] = {k: v for k, v in tsweep}
+        results["transfer"] = {}
+        for hw in harm_weights:
+            tgate, tsel = fit_full(df, args.model, harm_weight=hw)
+            gate_pe = dict(zip(qids, tgate.predict_proba(X)[:, 1]))
+            sel_pe = dict(zip(qids, tsel.predict(X)))
+            tsweep = []
+            for thr in THRESHOLDS:
+                dec = two_stage_decide(gate_pe, sel_pe, thr)
+                tsweep.append((f"hw={hw} thr={thr}",
+                               routed_scores(dec, escores)))
+            report_block(f"cross-dataset transfer, harm_weight={hw}", tsweep)
+            results["transfer"][f"hw={hw}"] = {k: v for k, v in tsweep}
 
     out = Path("outputs/arr")
     out.mkdir(parents=True, exist_ok=True)
@@ -274,6 +308,9 @@ if __name__ == "__main__":
     ap.add_argument("--eval_features")
     ap.add_argument("--eval_log")
     ap.add_argument("--model", default="logreg", choices=["logreg", "gbt"])
+    ap.add_argument("--harm_weights", default="1,3,5,10",
+                    help="comma list of gate sample weights for "
+                         "baseline-success negatives (1=unweighted)")
     ap.add_argument("--use_diag", action="store_true",
                     help="include CIKM diagnostic features if present")
     args = ap.parse_args()
