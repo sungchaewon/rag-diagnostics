@@ -164,16 +164,27 @@ def oof_one_stage(df, id_col, model_kind, seed=0):
     return dict(zip(df[id_col].values, pred.values))
 
 
-def fit_full(df, model_kind, harm_weight=1.0):
-    """Fit gate + selector on the full dataframe (for transfer)."""
-    X = df[NUMERIC + CATEG]
-    weights = gate_sample_weights(df, harm_weight)
+def fit_full(df, model_kind, harm_weight=1.0, seed=0):
+    """
+    Fit gate + selector on a bootstrap resample of the full dataframe
+    (for transfer). The bootstrap is what makes `seed` actually matter:
+    LogisticRegression's default lbfgs solver is deterministic given
+    identical training data, so refitting on the unmodified full dataframe
+    yields the identical model regardless of random_state, and a "5-seed"
+    sweep over that would just re-evaluate one model five times.
+    """
+    rng = np.random.RandomState(seed)
+    boot_idx = rng.randint(0, len(df), size=len(df))
+    dfb = df.iloc[boot_idx].reset_index(drop=True)
+
+    X = dfb[NUMERIC + CATEG]
+    weights = gate_sample_weights(dfb, harm_weight)
     gate = make_model(model_kind)
-    gate.fit(X, (df["best_action"] != "baseline").astype(int),
+    gate.fit(X, (dfb["best_action"] != "baseline").astype(int),
              clf__sample_weight=weights)
-    sel_mask = df["best_action"].isin(SELECTOR_ACTIONS)
+    sel_mask = dfb["best_action"].isin(SELECTOR_ACTIONS)
     sel = make_model(model_kind)
-    sel.fit(X[sel_mask.values], df["best_action"][sel_mask.values])
+    sel.fit(X[sel_mask.values], dfb["best_action"][sel_mask.values])
     return gate, sel
 
 
@@ -218,8 +229,8 @@ def multi_seed_eval(df, id_col, scores, model_kind, harm_weight, thr, seeds,
         in_em.append(r["em"]); in_f1.append(r["f1"]); in_harm.append(r["harmed"])
 
         if edf is not None:
-            # transfer: refit gate/selector on full train at this seed
-            g, sl = fit_full(df, model_kind, harm_weight=harm_weight)
+            # transfer: refit gate/selector on a bootstrap resample at this seed
+            g, sl = fit_full(df, model_kind, harm_weight=harm_weight, seed=s)
             X = edf[NUMERIC + CATEG]
             qids = edf[eid].values
             gp = dict(zip(qids, g.predict_proba(X)[:, 1]))
