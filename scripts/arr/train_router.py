@@ -195,6 +195,79 @@ def feature_importance(gate, sel):
 
 
 # ---------------------------------------------------------------- main
+def _mean_std(vals):
+    arr = np.array(vals, dtype=float)
+    return float(arr.mean()), float(arr.std(ddof=1)) if len(arr) > 1 else 0.0
+
+
+def multi_seed_eval(df, id_col, scores, model_kind, harm_weight, thr, seeds,
+                    edf=None, eid=None, escores=None):
+    """
+    Fix (harm_weight, threshold) and vary only the seed. Returns
+    mean/std of routed EM, F1, and harmed for in-dataset (OOF) and,
+    if eval data is given, for transfer. This is what decides whether
+    a small in-dataset gap (e.g. NQ +1%p) survives seed noise.
+    """
+    in_em, in_f1, in_harm = [], [], []
+    tr_em, tr_f1, tr_harm = [], [], []
+    for s in seeds:
+        gate_p, sel_p = oof_two_stage(df, id_col, model_kind,
+                                      harm_weight=harm_weight, seed=s)
+        dec = two_stage_decide(gate_p, sel_p, thr)
+        r = routed_scores(dec, scores)
+        in_em.append(r["em"]); in_f1.append(r["f1"]); in_harm.append(r["harmed"])
+
+        if edf is not None:
+            # transfer: refit gate/selector on full train at this seed
+            g, sl = fit_full(df, model_kind, harm_weight=harm_weight)
+            X = edf[NUMERIC + CATEG]
+            qids = edf[eid].values
+            gp = dict(zip(qids, g.predict_proba(X)[:, 1]))
+            sp = dict(zip(qids, sl.predict(X)))
+            tdec = two_stage_decide(gp, sp, thr)
+            tr = routed_scores(tdec, escores)
+            tr_em.append(tr["em"]); tr_f1.append(tr["f1"])
+            tr_harm.append(tr["harmed"])
+
+    out = {"n_seeds": len(seeds), "harm_weight": harm_weight, "threshold": thr,
+           "in_em": _mean_std(in_em), "in_f1": _mean_std(in_f1),
+           "in_harmed": _mean_std(in_harm), "in_em_raw": in_em}
+    if edf is not None:
+        out.update({"tr_em": _mean_std(tr_em), "tr_f1": _mean_std(tr_f1),
+                    "tr_harmed": _mean_std(tr_harm), "tr_em_raw": tr_em})
+    return out
+
+
+def report_seed_block(res, best_uniform_em, tr_uniform_em=None):
+    m, s = res["in_em"]
+    fm, fs = res["in_f1"]
+    hm, hs = res["in_harmed"]
+    print(f"\n=== multi-seed ({res['n_seeds']} seeds, "
+          f"hw={res['harm_weight']}, thr={res['threshold']}) ===")
+    print(f"in-dataset routed EM : {m:.4f} +/- {s:.4f}  "
+          f"(F1 {fm:.4f} +/- {fs:.4f}, harmed {hm:.1f} +/- {hs:.1f})")
+    delta = m - best_uniform_em
+    margin = delta / s if s > 0 else float("inf")
+    verdict = ("SIGNIFICANT" if delta > 2 * s else
+               "MARGINAL" if delta > s else "NOT DISTINGUISHABLE")
+    print(f"  vs best uniform {best_uniform_em:.4f}: "
+          f"delta {delta:+.4f} ({margin:.1f} sigma) -> {verdict}")
+    print(f"  per-seed EM: {[round(x, 4) for x in res['in_em_raw']]}")
+    if "tr_em" in res:
+        tm, ts = res["tr_em"]
+        thm, ths = res["tr_harmed"]
+        print(f"transfer routed EM  : {tm:.4f} +/- {ts:.4f}  "
+              f"(harmed {thm:.1f} +/- {ths:.1f})")
+        if tr_uniform_em is not None:
+            d = tm - tr_uniform_em
+            mg = d / ts if ts > 0 else float("inf")
+            v = ("SIGNIFICANT" if d > 2 * ts else
+                 "MARGINAL" if d > ts else "NOT DISTINGUISHABLE")
+            print(f"  vs eval best uniform {tr_uniform_em:.4f}: "
+                  f"delta {d:+.4f} ({mg:.1f} sigma) -> {v}")
+        print(f"  per-seed EM: {[round(x, 4) for x in res['tr_em_raw']]}")
+
+
 def report_block(title, rows):
     print(f"\n=== {title} ===")
     print(f"{'setting':<34}{'EM':>8}{'F1':>8}{'rep%':>7}"
@@ -293,6 +366,25 @@ def main(args):
             report_block(f"cross-dataset transfer, harm_weight={hw}", tsweep)
             results["transfer"][f"hw={hw}"] = {k: v for k, v in tsweep}
 
+    # multi-seed verification at a fixed (harm_weight, threshold)
+    if args.seeds:
+        seeds = [int(x) for x in args.seeds.split(",")]
+        bu_em = max(v["em"] for k, v in results["baselines"].items()
+                    if k != "oracle_routing")
+        edf2 = eid2 = escores2 = None
+        tr_bu = None
+        if args.eval_features and args.eval_log:
+            edf2, eid2 = load_features(args.eval_features)
+            escores2 = load_action_scores(args.eval_log)
+            tr_bu = max(v["em"] for k, v in results["eval_baselines"].items()
+                        if k != "oracle_routing")
+        seed_res = multi_seed_eval(
+            df, id_col, scores, args.model,
+            harm_weight=args.fix_hw, thr=args.fix_thr, seeds=seeds,
+            edf=edf2, eid=eid2, escores=escores2)
+        report_seed_block(seed_res, bu_em, tr_bu)
+        results["multi_seed"] = seed_res
+
     out = Path("outputs/arr")
     out.mkdir(parents=True, exist_ok=True)
     suffix = "diag" if args.use_diag and "diagnostic" in feat_label else "surface"
@@ -313,5 +405,12 @@ if __name__ == "__main__":
                          "baseline-success negatives (1=unweighted)")
     ap.add_argument("--use_diag", action="store_true",
                     help="include CIKM diagnostic features if present")
+    ap.add_argument("--seeds", default="",
+                    help="comma list of seeds for multi-seed verification, "
+                         "e.g. 0,1,2,3,4 (empty = skip)")
+    ap.add_argument("--fix_hw", type=float, default=5.0,
+                    help="harm_weight fixed during multi-seed run")
+    ap.add_argument("--fix_thr", type=float, default=0.4,
+                    help="gate threshold fixed during multi-seed run")
     args = ap.parse_args()
     main(args)
