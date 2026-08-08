@@ -6,18 +6,9 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-from src.retrieval.bm25_baseline import retrieve_bm25
-from src.generation.gpt4omini import generate as _raw_generate
-from src.repairs.retrieval_repair import retrieval_repair
-from src.repairs.generation_repair import generation_repair
-from src.repairs.generation_repair_v2 import generation_repair_v2
-from src.repairs.generation_repair_v3 import generation_repair_v3
-from eval.metrics import compute_em, compute_f1
+import src.generation.gpt4omini as gpt4omini_mod
 
 MODEL = "gpt-4o"
-
-# rough per-1M-token USD pricing for cost estimate only
 PRICE_IN = 2.5
 PRICE_OUT = 10.0
 
@@ -27,26 +18,22 @@ _usage = {"in_tokens": 0, "out_tokens": 0, "calls": 0}
 
 
 def _estimate_tokens(text):
-    # rough heuristic: ~1.3 tokens per word, good enough for a cost
-    # order-of-magnitude check, not an exact count
     return max(1, int(len(str(text).split()) * 1.3))
 
 
-def generate(question, contexts, model=MODEL):
-    """Retry-wrapped generate() with rough token/cost tracking."""
+def _retry_call(fn, in_est_text, *args, **kwargs):
+    """Shared retry+accounting wrapper for both generate() and gpt()."""
     import openai
 
-    ctx_text = "\n\n".join(contexts) if isinstance(contexts, list) else contexts
-    in_est = _estimate_tokens(question) + _estimate_tokens(ctx_text) + 60
-
+    in_est = _estimate_tokens(in_est_text) + 60
     attempt = 0
     while True:
         try:
-            ans = _raw_generate(question, contexts, model=model)
+            out = fn(*args, **kwargs)
             _usage["in_tokens"] += in_est
-            _usage["out_tokens"] += _estimate_tokens(ans)
+            _usage["out_tokens"] += _estimate_tokens(out)
             _usage["calls"] += 1
-            return ans
+            return out
         except openai.RateLimitError as e:
             attempt += 1
             if attempt > _MAX_RETRIES:
@@ -57,6 +44,34 @@ def generate(question, contexts, model=MODEL):
             print(f"[rate-limit] attempt {attempt}, sleeping {wait_s:.1f}s",
                   flush=True)
             time.sleep(wait_s)
+
+
+_orig_generate = gpt4omini_mod.generate
+_orig_gpt = gpt4omini_mod.gpt
+
+
+def _wrapped_generate(question, context, model=MODEL):
+    ctx_text = "\n\n".join(context) if isinstance(context, list) else context
+    return _retry_call(_orig_generate, f"{question}\n{ctx_text}",
+                       question, context, model=model)
+
+
+def _wrapped_gpt(prompt, model=MODEL):
+    return _retry_call(_orig_gpt, prompt, prompt, model=model)
+
+
+gpt4omini_mod.generate = _wrapped_generate
+gpt4omini_mod.gpt = _wrapped_gpt
+
+# now safe to import -- these bind the wrapped generate/gpt above
+from src.retrieval.bm25_baseline import retrieve_bm25
+from src.repairs.retrieval_repair import retrieval_repair
+from src.repairs.generation_repair import generation_repair
+from src.repairs.generation_repair_v2 import generation_repair_v2
+from src.repairs.generation_repair_v3 import generation_repair_v3
+from eval.metrics import compute_em, compute_f1
+
+generate = _wrapped_generate
 
 
 def normalize_contexts(contexts):
