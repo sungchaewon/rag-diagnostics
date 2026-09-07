@@ -1,5 +1,6 @@
 import argparse
 import json
+import random
 import re
 import time
 from pathlib import Path
@@ -83,7 +84,7 @@ def save(path, results):
         json.dump(results, f, indent=2, ensure_ascii=False)
 
 
-def run(log_path, action, output_path, resume=True):
+def run(log_path, action, output_path, n_samples=None, resume=True, seed=0):
     with open(log_path) as f:
         raw = json.load(f)
     records = raw["results"] if isinstance(raw, dict) and "results" in raw \
@@ -93,10 +94,21 @@ def run(log_path, action, output_path, resume=True):
         r for r in records
         if action in r and r["baseline"]["em"] == 1 and r[action]["em"] == 0
     ]
+    total_harm = len(harm_cases)
+    if n_samples and n_samples < total_harm:
+        # shuffle once then slice (not rng.sample) so a larger n_samples on a
+        # later run is always a superset of a smaller one with the same seed
+        # -- rng.sample's result isn't nested across different k.
+        rng = random.Random(seed)
+        shuffled = harm_cases[:]
+        rng.shuffle(shuffled)
+        harm_cases = shuffled[:n_samples]
     print(f"log: {log_path}")
     print(f"action: {action}")
-    print(f"harm cases found (baseline correct, {action} wrong by EM): "
-          f"{len(harm_cases)}")
+    print(f"total harm cases (EM-based): {total_harm}")
+    print(f"cases to judge: {len(harm_cases)}"
+          + (f" (random sample, seed={seed})" if n_samples and n_samples < total_harm
+             else " (full set)"))
 
     results = load_done(output_path) if resume else []
     done_ids = {str(r["id"]) for r in results}
@@ -129,10 +141,22 @@ def run(log_path, action, output_path, resume=True):
             print(f"  checkpoint @ {len(results)}", flush=True)
 
     save(output_path, results)
-    summarize(results, records, action)
+    summarize(results, records, action, total_harm)
 
 
-def summarize(results, all_records, action):
+def _wilson_ci(k, n, z=1.96):
+    """95% Wilson score interval for a proportion -- more honest than a
+    normal approximation when n is small (30-50 samples here)."""
+    if n == 0:
+        return (0.0, 0.0)
+    p = k / n
+    denom = 1 + z**2 / n
+    center = (p + z**2 / (2 * n)) / denom
+    half = (z * ((p * (1 - p) / n + z**2 / (4 * n**2)) ** 0.5)) / denom
+    return (max(0.0, center - half), min(1.0, center + half))
+
+
+def summarize(results, all_records, action, total_harm=None):
     n = len(results)
     if n == 0:
         print("\nno harm cases to summarize")
@@ -140,24 +164,47 @@ def summarize(results, all_records, action):
 
     surface_mismatch = sum(1 for r in results if r["llm_judge_correct"])
     genuine_harm = n - surface_mismatch
+    total_harm = total_harm if total_harm is not None else n
+    is_sample = n < total_harm
+
+    genuine_rate = genuine_harm / n
+    lo, hi = _wilson_ci(genuine_harm, n)
 
     print(f"\n=== LLM-judge re-scoring of {action} harm cases ===")
-    print(f"total EM-harmed: {n}")
+    print(f"total EM-harmed (population): {total_harm}")
+    print(f"judged: {n}" + (" (random sample)" if is_sample else " (full set)"))
     print(f"  surface-form mismatch (LLM says CORRECT): {surface_mismatch} "
           f"({surface_mismatch / n:.1%})")
     print(f"  genuine harm (LLM says INCORRECT): {genuine_harm} "
-          f"({genuine_harm / n:.1%})")
+          f"({genuine_rate:.1%}, 95% CI [{lo:.1%}, {hi:.1%}])")
 
-    # recompute net gain for this action under LLM-judge scoring
     fixed = sum(
         1 for r in all_records
         if action in r and r["baseline"]["em"] == 0 and r[action]["em"] == 1
     )
-    net_em = fixed - n
-    net_judge = fixed - genuine_harm
-    print(f"\nnet gain under EM: {fixed} fixed - {n} harmed = {net_em}")
-    print(f"net gain under LLM-judge: {fixed} fixed - {genuine_harm} "
-          f"corrected-harmed = {net_judge}")
+    net_em = fixed - total_harm
+    print(f"\nnet gain under EM: {fixed} fixed - {total_harm} harmed = {net_em}")
+
+    if is_sample:
+        # extrapolate the judged genuine-harm rate to the full harm
+        # population -- mixing a sample-scale count with a population-scale
+        # `fixed` would silently understate harm and overstate net gain
+        est_genuine = total_harm * genuine_rate
+        est_lo = total_harm * lo
+        est_hi = total_harm * hi
+        net_point = fixed - est_genuine
+        net_lo = fixed - est_hi
+        net_hi = fixed - est_lo
+        print(f"net gain under LLM-judge (extrapolated from {n}-sample rate): "
+              f"{fixed} fixed - ~{est_genuine:.0f} corrected-harmed "
+              f"= ~{net_point:.0f}  (95% CI: [{net_lo:.0f}, {net_hi:.0f}])")
+        print(f"(genuine-harm rate {genuine_rate:.1%} from this sample is "
+              f"applied to the full {total_harm}-case population; widen the "
+              f"sample if the CI is too wide to be useful)")
+    else:
+        net_judge = fixed - genuine_harm
+        print(f"net gain under LLM-judge: {fixed} fixed - {genuine_harm} "
+              f"corrected-harmed = {net_judge}")
     print(f"(fixed count is EM-based and not re-judged here -- judging "
           f"harm cases only, since that's the count driving the uniform-"
           f"application net loss)")
@@ -168,6 +215,12 @@ if __name__ == "__main__":
     ap.add_argument("--log", required=True)
     ap.add_argument("--action", default="generation_repair_v3")
     ap.add_argument("--output", required=True)
+    ap.add_argument("--n_samples", type=int, default=None,
+                    help="random sample size from harm cases (omit = judge "
+                         "all harm cases)")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="random seed for sampling, for reproducibility")
     ap.add_argument("--no_resume", action="store_true")
     args = ap.parse_args()
-    run(args.log, args.action, args.output, resume=not args.no_resume)
+    run(args.log, args.action, args.output, args.n_samples,
+        resume=not args.no_resume, seed=args.seed)
