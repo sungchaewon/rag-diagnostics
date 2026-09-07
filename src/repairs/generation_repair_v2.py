@@ -87,10 +87,12 @@ If the context truly has no answer, output: unknown
 
 
 def generation_repair_v2(question, context, baseline_answer,
-                         grounding_threshold=0.6):
+                         grounding_threshold=0.6,
+                         model="gpt-4o-mini"):
     base = _clean(baseline_answer)
 
-    raw = gpt(PROMPT.format(question=question, context=context, base=base))
+    raw = gpt(PROMPT.format(question=question, context=context, base=base),
+         model=model)
     out = _clean(raw)
 
     # fall back to baseline only on clearly degenerate outputs

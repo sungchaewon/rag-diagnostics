@@ -58,7 +58,8 @@ def too_long(ans, limit=12):
     return not ans or len(ans.split()) > limit
 
 
-def generation_repair(question, context, baseline_answer):
+def generation_repair(question, context, baseline_answer,
+                      model="gpt-4o-mini"):
     base = clean(baseline_answer)
 
     if in_context(base, context):
@@ -88,7 +89,7 @@ Initial answer:
 Final answer:
 """
 
-    out = clean(gpt(prompt))
+    out = clean(gpt(prompt, model=model))
 
     if not out:
         return base

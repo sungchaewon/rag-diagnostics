@@ -1,17 +1,82 @@
 import json
 import argparse
+import re
+import time
 from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+# Same patch-before-import requirement as run_backbone_repair.py: see
+# that file's comment for why gpt4omini.gpt must be patched before the
+# generation_repair modules are imported.
+import src.generation.gpt4omini as gpt4omini_mod
+
+MODEL = "gpt-4o"
+PRICE_IN = 2.5
+PRICE_OUT = 10.0
+
+_WAIT_RE = re.compile(r"try again in ([\d.]+)\s*s", re.IGNORECASE)
+_MAX_RETRIES = 2000
+_usage = {"in_tokens": 0, "out_tokens": 0, "calls": 0}
+
+
+def _estimate_tokens(text):
+    return max(1, int(len(str(text).split()) * 1.3))
+
+
+def _retry_call(fn, in_est_text, *args, **kwargs):
+    import openai
+
+    in_est = _estimate_tokens(in_est_text) + 60
+    attempt = 0
+    while True:
+        try:
+            out = fn(*args, **kwargs)
+            _usage["in_tokens"] += in_est
+            _usage["out_tokens"] += _estimate_tokens(out)
+            _usage["calls"] += 1
+            return out
+        except openai.RateLimitError as e:
+            attempt += 1
+            if attempt > _MAX_RETRIES:
+                raise
+            msg = str(e)
+            m = _WAIT_RE.search(msg)
+            wait_s = float(m.group(1)) + 1.0 if m else min(30 * attempt, 300)
+            print(f"[rate-limit] attempt {attempt}, sleeping {wait_s:.1f}s",
+                  flush=True)
+            time.sleep(wait_s)
+
+
+_orig_generate = gpt4omini_mod.generate
+_orig_gpt = gpt4omini_mod.gpt
+
+
+def _wrapped_generate(question, context, model=MODEL):
+    ctx_text = "\n\n".join(context) if isinstance(context, list) else context
+    return _retry_call(_orig_generate, f"{question}\n{ctx_text}",
+                       question, context, model=model)
+
+
+def _wrapped_gpt(prompt, model=MODEL):
+    return _retry_call(_orig_gpt, prompt, prompt, model=model)
+
+
+gpt4omini_mod.generate = _wrapped_generate
+gpt4omini_mod.gpt = _wrapped_gpt
+
+# now safe to import -- these bind the wrapped generate/gpt above.
+# ONLY DIFFERENCE from run_backbone_repair.py: dense_baseline instead
+# of bm25_baseline.
 from src.retrieval.dense_baseline import retrieve_dense
-from src.generation.gpt4omini import generate
 from src.repairs.retrieval_repair import retrieval_repair
 from src.repairs.generation_repair import generation_repair
 from src.repairs.generation_repair_v2 import generation_repair_v2
 from src.repairs.generation_repair_v3 import generation_repair_v3
 from eval.metrics import compute_em, compute_f1
+
+generate = _wrapped_generate
 
 
 def normalize_contexts(contexts):
@@ -41,18 +106,18 @@ class DenseRetriever:
         return normalize_contexts(retrieve_dense(query, top_k=top_k))
 
 
-class SimpleGenerator:
+class ModelGenerator:
     def generate(self, question, contexts):
-        return generate(question, contexts)
+        return generate(question, contexts, model=MODEL)
 
 
-def load_samples(diagnosis_path):
+def load_samples(diagnosis_path, n_samples):
     raw = json.loads(Path(diagnosis_path).read_text())
     rows = raw["results"] if isinstance(raw, dict) and "results" in raw else raw
     if not isinstance(rows, list):
-        sys.exit(f"[run_dense_repair] unexpected diagnosis structure in "
+        sys.exit(f"[dense-backbone] unexpected diagnosis structure in "
                  f"{diagnosis_path}")
-    return rows
+    return rows[:n_samples] if n_samples else rows
 
 
 def load_done(path):
@@ -73,18 +138,15 @@ def save(path, results):
         json.dump(results, f, indent=2, ensure_ascii=False)
 
 
-def run(diagnosis_path, output_path, n_samples=None, resume=True):
-    samples = load_samples(diagnosis_path)
-    if n_samples:
-        samples = samples[:n_samples]
-
+def run(diagnosis_path, output_path, n_samples, resume=True):
+    samples = load_samples(diagnosis_path, n_samples)
     results = load_done(output_path) if resume else []
     done_ids = {str(r["id"]) for r in results}
     if results:
         print(f"Resume: {len(results)}/{len(samples)} already done", flush=True)
 
     retriever = DenseRetriever()
-    generator = SimpleGenerator()
+    generator = ModelGenerator()
 
     for i, sample in enumerate(samples):
         sid = str(sample.get("id", i))
@@ -93,68 +155,51 @@ def run(diagnosis_path, output_path, n_samples=None, resume=True):
 
         q = sample["question"]
         gold = get_gold_answers(sample)
-        rank_bucket = sample.get("rank_bucket", "unknown")
         qtype = sample.get("question_type", "other")
-        best_oracle = sample.get("best_oracle_stage", "baseline")
 
         print(f"[{i + 1}/{len(samples)}] {q[:60]}", flush=True)
 
-        # baseline (dense retrieval)
         base_ctx = retriever.retrieve(q, top_k=10)
-        base_answer = generate(q, base_ctx)
+        base_answer = generate(q, base_ctx, model=MODEL)
 
-        # retrieval repair (dense retriever passed through)
         rr = retrieval_repair(q, retriever, generator, top_k=10)
         rr_answer = rr["repaired_answer"]
 
-        # generation repair V1 (uses baseline's dense context, top-5)
         context_str = "\n\n".join(base_ctx[:5])
-        v1_answer = generation_repair(q, context_str, base_answer)
-
-        # generation repair V2 / V3 (same dense context)
-        v2_answer = generation_repair_v2(q, context_str, base_answer)
+        v1_answer = generation_repair(q, context_str, base_answer, model=MODEL)
+        v2_answer = generation_repair_v2(q, context_str, base_answer, model=MODEL)
         v3_answer = generation_repair_v3(q, context_str, base_answer,
-                                         question_type=qtype)
+                                         question_type=qtype, model=MODEL)
 
         result = {
             "id": sid,
             "question": q,
             "golden_answers": gold,
-            "rank_bucket": rank_bucket,
             "question_type": qtype,
-            "best_oracle_stage": best_oracle,
-            "baseline": {
-                "pred": base_answer,
-                "em": compute_em(base_answer, gold),
-                "f1": compute_f1(base_answer, gold),
-            },
-            "retrieval_repair": {
-                "rewritten_query": rr.get("rewritten_query"),
-                "pred": rr_answer,
-                "em": compute_em(rr_answer, gold),
-                "f1": compute_f1(rr_answer, gold),
-            },
-            "generation_repair": {
-                "pred": v1_answer,
-                "em": compute_em(v1_answer, gold),
-                "f1": compute_f1(v1_answer, gold),
-            },
-            "generation_repair_v2": {
-                "pred": v2_answer,
-                "em": compute_em(v2_answer, gold),
-                "f1": compute_f1(v2_answer, gold),
-            },
-            "generation_repair_v3": {
-                "pred": v3_answer,
-                "em": compute_em(v3_answer, gold),
-                "f1": compute_f1(v3_answer, gold),
-            },
+            "retriever": "dense",
+            "model": MODEL,
+            "baseline": {"pred": base_answer, "em": compute_em(base_answer, gold),
+                        "f1": compute_f1(base_answer, gold)},
+            "retrieval_repair": {"rewritten_query": rr.get("rewritten_query"),
+                                 "pred": rr_answer,
+                                 "em": compute_em(rr_answer, gold),
+                                 "f1": compute_f1(rr_answer, gold)},
+            "generation_repair": {"pred": v1_answer, "em": compute_em(v1_answer, gold),
+                                  "f1": compute_f1(v1_answer, gold)},
+            "generation_repair_v2": {"pred": v2_answer, "em": compute_em(v2_answer, gold),
+                                     "f1": compute_f1(v2_answer, gold)},
+            "generation_repair_v3": {"pred": v3_answer, "em": compute_em(v3_answer, gold),
+                                     "f1": compute_f1(v3_answer, gold)},
         }
         results.append(result)
 
-        if len(results) % 50 == 0:
+        if len(results) % 25 == 0:
             save(output_path, results)
-            print(f"  checkpoint @ {len(results)}", flush=True)
+            cost = (_usage["in_tokens"] / 1e6 * PRICE_IN +
+                   _usage["out_tokens"] / 1e6 * PRICE_OUT)
+            print(f"  checkpoint @ {len(results)}  "
+                  f"(est. cost so far: ${cost:.2f}, {_usage['calls']} calls)",
+                  flush=True)
 
     save(output_path, results)
     summarize(results)
@@ -162,35 +207,45 @@ def run(diagnosis_path, output_path, n_samples=None, resume=True):
 
 def summarize(results):
     n = len(results)
+    if n == 0:
+        print("no results")
+        return
     actions = ["baseline", "retrieval_repair", "generation_repair",
               "generation_repair_v2", "generation_repair_v3"]
-    print(f"\n=== Dense retriever, uniform application (n={n}) ===")
+    print(f"\n=== Retriever=dense, Backbone={MODEL}, uniform application (n={n}) ===")
     for a in actions:
-        if not all(a in r for r in results):
-            continue
         em = sum(r[a]["em"] for r in results) / n
         f1 = sum(r[a]["f1"] for r in results) / n
         helped = sum(1 for r in results if r[a]["em"] > r["baseline"]["em"])
         harmed = sum(1 for r in results if r[a]["em"] < r["baseline"]["em"])
+        net = helped - harmed
         print(f"{a:24s} EM {em:.4f}  F1 {f1:.4f}  "
-              f"(+{helped} / -{harmed} vs baseline)")
+              f"(+{helped} / -{harmed}, net {net:+d} vs baseline)")
+    orc_em = sum(max(r[a]["em"] for a in actions) for r in results) / n
+    best_uni = max(sum(r[a]["em"] for r in results) / n for a in actions)
+    print(f"\nOracle routing EM {orc_em:.4f}  "
+          f"(gap vs best uniform: {orc_em - best_uni:+.4f})")
 
-    avail = [a for a in actions if all(a in r for r in results)]
-    orc_em = sum(max(r[a]["em"] for a in avail) for r in results) / n
-    best_uni = max(sum(r[a]["em"] for r in results) / n for a in avail)
-    print(f"\nOracle routing over {{{', '.join(avail)}}}")
-    print(f"  EM {orc_em:.4f}  (gap vs best uniform: {orc_em - best_uni:+.4f})")
-
-    print("\n(compare these numbers directly against the BM25 log's "
-          "'Uniform application' summary to check retriever generality)")
+    cost = (_usage["in_tokens"] / 1e6 * PRICE_IN +
+           _usage["out_tokens"] / 1e6 * PRICE_OUT)
+    print(f"\n[cost estimate] {_usage['calls']} calls, "
+          f"~{_usage['in_tokens']:,} in / ~{_usage['out_tokens']:,} out tokens "
+          f"(word-count heuristic, not exact)")
+    print(f"[cost estimate] approx ${cost:.2f} USD at "
+          f"${PRICE_IN}/1M in + ${PRICE_OUT}/1M out")
+    print("\n(compare retrieval_repair's net here against:")
+    print("  BM25 + mini   -> net was strongly positive")
+    print("  Dense + mini  -> net was negative (the reversal)")
+    print("  BM25 + gpt-4o -> net stayed positive, even stronger")
+    print(" this run tells you whether a stronger backbone rescues dense's"
+          " reversal, or whether the two axes act independently)")
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--diagnosis", required=True,
-                    help="CIKM diagnosis json, e.g. outputs/cikm/nq_1500/results.json")
+    ap.add_argument("--diagnosis", required=True)
     ap.add_argument("--output", required=True)
-    ap.add_argument("--n_samples", type=int, default=None)
+    ap.add_argument("--n_samples", type=int, default=300)
     ap.add_argument("--no_resume", action="store_true")
     args = ap.parse_args()
     run(args.diagnosis, args.output, args.n_samples, resume=not args.no_resume)

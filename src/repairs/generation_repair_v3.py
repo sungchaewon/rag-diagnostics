@@ -86,14 +86,16 @@ Only output "unknown" on the last line if no candidate exists at all.
 
 
 def generation_repair_v3(question, context, baseline_answer=None,
-                         question_type=None):
+                         question_type=None,
+                         model="gpt-4o-mini"):
     """baseline_answer is accepted for interface compatibility but is only
     used as a last-resort fallback for degenerate model outputs."""
     hint = FORMAT_HINTS.get(
         infer_question_type(question, question_type), DEFAULT_HINT
     )
 
-    raw = gpt(PROMPT.format(question=question, context=context, hint=hint))
+    raw = gpt(PROMPT.format(question=question, context=context, hint=hint),
+         model=model)
     out = _clean(raw)
 
     if not out and baseline_answer:
