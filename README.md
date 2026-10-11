@@ -34,9 +34,9 @@ The exact repair prompts are listed in the paper appendix.
 
 ## Setup
 
+Main dependencies: Python 3.10+, scikit-learn, `rank_bm25`, an E5 encoder (`intfloat/e5-base-v2`), and the OpenAI Python client.
+
 ```bash
-# Python 3.10+
-pip install -r requirements.txt
 export OPENAI_API_KEY=<your key>   # required for generation and repair calls
 ```
 
@@ -44,30 +44,15 @@ Experiments call the OpenAI API; no API keys are stored in this repository.
 
 ## Reproducing the Experiments
 
-> TODO (fill in before release): replace each `<...>` with the actual script name and arguments.
-
-```bash
-# 1. Prepare corpora and questions
-python scripts/<prepare_script>.py
-
-# 2. Run baseline RAG and repair actions (BM25 / dense; GPT-4o-mini / GPT-4o)
-python scripts/<run_repair_script>.py --retriever <bm25|dense> --dataset <nq|triviaqa>
-
-# 3. Train and evaluate the gate + selector router
-python scripts/<run_router_script>.py --hw 5
-
-# 4. Controls, transfer, and restricted-baseline analyses
-python scripts/<controls_script>.py
-python scripts/reviewer_defense.py
-```
+Scripts for the experiments in this paper are in `scripts/arr/` (e.g., `reviewer_defense.py` for the restricted-baseline and control analyses and `run_neutral_tqa.sh` for the retriever-neutral rewrite control). Earlier data-preparation and pipeline scripts are in `scripts/`.
 
 ## Repository Structure
 
 ```
 .
 ├── data/              # controlled corpora and question samples
-├── figures/           # figures
-├── scripts/           # data preparation, experiment, and analysis scripts
+├── scripts/
+│   └── arr/           # scripts for the experiments in this paper
 ├── src/
 │   ├── evaluation/
 │   ├── generation/
