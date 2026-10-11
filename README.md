@@ -1,118 +1,82 @@
-# rag-diagnostics
+# Harm-Aware Multi-Action Routing for Selective RAG Repair
 
-Oracle-based diagnosis for modular Retrieval-Augmented Generation (RAG) pipelines.
+Anonymous code release accompanying an ACL Rolling Review submission.
 
-This repository contains the experimental code for a KDD Undergraduate Consortium submission on diagnosing bottlenecks in multi-stage RAG pipelines. Instead of evaluating a RAG system only with end-to-end answer quality, this project applies stage-wise oracle interventions and split-based analysis to identify where failures occur.
+This repository contains the code for studying **inference-time repair of completed RAG answers**. A repair action can fix one query while corrupting another, so we frame repair as a *selective intervention* problem and train a two-stage, harm-aware router that (1) decides whether to preserve the baseline answer and (2) selects among heterogeneous repair actions.
 
 ## Overview
 
-Retrieval-Augmented Generation (RAG) systems commonly consist of multiple stages, including retrieval, reranking, and generation. However, aggregate metrics such as Exact Match (EM) and token-level F1 do not directly reveal whether failures are caused by missing evidence, poor ranking, or generation errors.
+Given a query, retrieved contexts, and a baseline RAG answer, the router decides:
 
-This project investigates a modular RAG pipeline through oracle-based interventions. By injecting gold evidence at different stages, we analyze how much each component affects final answer quality. In addition to average oracle gains, we further examine subset-level results by retrieval outcome and question type to reveal hidden bottlenecks that may be obscured by aggregate performance.
+1. **Gate (preserve vs. intervene).** A logistic-regression gate trained with weighted binary cross-entropy. Baseline-success examples whose best action is to preserve the baseline receive an extra weight `h_w` (main experiments: `h_w = 5`). Repair is invoked when the gate probability is at least a threshold `tau`.
+2. **Selector.** A three-way logistic-regression selector over retrieval repair, Generation V2, and Generation V3, applied only to queries admitted by the gate.
 
-![Oracle-based diagnosis overview](figure.png)
+Outcomes are reported as *Fixed* (baseline wrong, repaired right), *Harmed* (baseline right, repaired wrong), and *Net* = Fixed - Harmed.
 
 ## Experimental Setting
 
-- Dataset: Natural Questions
-- Retriever: BM25
-- Reranker: BAAI/bge-reranker-v2-m3
-- Generator: GPT-4o-mini
-- Metrics: Exact Match (EM), token-level F1
+- **Data:** Natural Questions and TriviaQA (first 1,500 qualifying validation questions each), using controlled gold-passage-only corpora.
+- **Retrievers:** BM25 (`rank_bm25.BM25Okapi`) and dense retrieval (`intfloat/e5-base-v2`).
+- **Generators:** GPT-4o-mini (primary) and GPT-4o (backbone comparison on NQ / BM25).
+- **Metrics:** Exact Match, token-level F1, and fixed / harmed / net counts.
+- **Evaluation:** five-fold stratified out-of-fold prediction over five seeds, paired-bootstrap 95% confidence intervals, McNemar / sign tests, and nested cross-validation.
 
-## Pipeline
+## Repair Actions
 
-The baseline pipeline follows a standard multi-stage RAG structure:
+| Action | Description |
+|---|---|
+| Retrieval repair | Rewrite the query, retrieve with rewritten and original queries, interleave and deduplicate contexts, re-answer. |
+| Generation V1 | Conservative verification with exact-substring grounding (analyzed in uniform repair only). |
+| Generation V2 | Evidence-first re-answering with an answer-token grounding check (>= 0.6). |
+| Generation V3 | Fresh question-type-conditioned extraction without showing the baseline answer. |
 
-1. Retrieve candidate passages using BM25.
-2. Rerank retrieved passages using a cross-encoder reranker.
-3. Generate a short answer using GPT-4o-mini based on the provided context.
-4. Evaluate the generated answer against the gold answer.
+The exact repair prompts are listed in the paper appendix.
 
-## Oracle Interventions
+## Setup
 
-The following experimental conditions are used to diagnose stage-level bottlenecks.
+```bash
+# Python 3.10+
+pip install -r requirements.txt
+export OPENAI_API_KEY=<your key>   # required for generation and repair calls
+```
 
-### Baseline
+Experiments call the OpenAI API; no API keys are stored in this repository.
 
-A standard RAG pipeline without oracle intervention.
+## Reproducing the Experiments
 
-### Oracle-R
+> TODO (fill in before release): replace each `<...>` with the actual script name and arguments.
 
-The gold supporting passage is forced into the retrieved candidate set.
+```bash
+# 1. Prepare corpora and questions
+python scripts/<prepare_script>.py
 
-This condition tests whether retrieval failure is a major bottleneck. If performance improves substantially under Oracle-R, it suggests that the retriever often fails to include the necessary evidence.
+# 2. Run baseline RAG and repair actions (BM25 / dense; GPT-4o-mini / GPT-4o)
+python scripts/<run_repair_script>.py --retriever <bm25|dense> --dataset <nq|triviaqa>
 
-### Oracle-Re
+# 3. Train and evaluate the gate + selector router
+python scripts/<run_router_script>.py --hw 5
 
-The gold supporting passage is forced into the candidate set and ranked at the top.
-
-This condition tests whether reranking quality affects downstream answer generation. If Oracle-Re improves over Oracle-R, it suggests that the correct evidence may be present but not ranked highly enough to guide the generator effectively.
-
-### Oracle-G
-
-The gold supporting passage is directly provided to the generator.
-
-This condition tests the remaining generation-side bottleneck when the correct evidence is available. If performance remains limited even under Oracle-G, it suggests that the generator may still fail due to answer formatting, extraction errors, or ambiguity in the evidence.
-
-### Oracle-All
-
-An optional upper-bound setting where all relevant oracle information is provided.
-
-## Analysis
-
-The experiments are designed to answer the following questions:
-
-- How much does each stage-wise oracle intervention improve end-to-end performance?
-- Do average oracle gains obscure heterogeneous subset-level bottlenecks?
-- How does the dominant bottleneck vary by question type?
-- How does the bottleneck vary with retrieval outcome?
-
-To answer these questions, the project analyzes both overall performance and split-level performance.
-
-### Retrieval Outcome Split
-
-Questions are divided based on whether BM25 retrieves the gold passage within the top-k candidates.
-
-- BM25-Hit: the gold passage is included in the retrieved candidates.
-- BM25-Miss: the gold passage is not included in the retrieved candidates.
-
-This split helps distinguish cases where the pipeline fails despite retrieving the correct evidence from cases where retrieval failure is the primary bottleneck.
-
-### Question Type Split
-
-Questions are also grouped by question type, such as:
-
-- who
-- when
-- where
-- what
-- how many
-
-This analysis helps identify whether different types of questions depend more heavily on retrieval, reranking, or generation quality.
+# 4. Controls, transfer, and restricted-baseline analyses
+python scripts/<controls_script>.py
+python scripts/reviewer_defense.py
+```
 
 ## Repository Structure
 
-```text
-rag-diagnostics/
-├── data/
-│   ├── corpus/
-│   └── nq_sample/
-├── figures/
-│   └── intro3.png
-├── scripts/
-│   ├── add_labels.py
-│   ├── analyze_hit_miss.py
-│   ├── analyze_question_type.py
-│   ├── check_retrieval.py
-│   ├── extract_cases.py
-│   ├── prepare_mini_corpus_500.py
-│   ├── prepare_nq_500.py
-│   ├── run_experiments.py
-│   └── verify_miss_baseline.py
+```
+.
+├── data/              # controlled corpora and question samples
+├── figures/           # figures
+├── scripts/           # data preparation, experiment, and analysis scripts
 ├── src/
 │   ├── evaluation/
 │   ├── generation/
 │   └── retrieval/
 └── README.md
 ```
+
+## Notes
+
+- Results in the paper use temperature 0 for all generation calls.
+- Dense routing features store cosine-similarity statistics in the same interface as BM25 score statistics.
+- Some analysis scripts reuse the corpora and the pre-existing retrieval / Generation-V1 pipeline from earlier diagnostic experiments on the same data; those scripts are kept for completeness.
