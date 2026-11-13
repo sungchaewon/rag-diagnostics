@@ -14,7 +14,11 @@ Outputs:
 - --out_log: the log with each action's "em" replaced by the semantic label
   (original kept as "em_exact"; "f1" unchanged). Readable by router_common.
 - --out_features: the router feature CSV with best_action / baseline_em recomputed
-  from semantic labels (same lexicographic rule as extract_router_features.best_action).
+  from semantic labels. The rule is extract_router_features.best_action (correctness,
+  then token F1, then action priority), except that a semantically correct baseline is
+  always labeled "baseline". Without that exception, a correct baseline tied with a
+  correct repair would lose on lexical F1 to the repair that copies the gold spelling,
+  so surface-form rewrites of correct answers would be labeled as interventions.
 
 Evaluate with the existing script, e.g.
     # trained and evaluated on semantic labels
@@ -89,6 +93,11 @@ def semantic_label(rec, action, cache):
     return int(cache[cache_key(rec["question"], pred)])
 
 
+def semantic_best_action(rec, actions):
+    """Preserve a semantically correct baseline; otherwise the original lexicographic rule."""
+    return "baseline" if rec["baseline"]["em"] == 1 else best_action(rec, actions)
+
+
 def run_judge(todo, cache, cache_path, workers):
     from llm_judge_harm import judge  # imports the OpenAI client; only needed when calling
 
@@ -145,7 +154,7 @@ def main():
     if missing:
         sys.exit(f"[semantic_relabel] {len(missing)} feature ids not in the log, e.g. {sorted(missing)[:3]}")
     old_best = feats["best_action"].copy()
-    feats["best_action"] = [best_action(by_id[i], actions) for i in feats["id"]]
+    feats["best_action"] = [semantic_best_action(by_id[i], actions) for i in feats["id"]]
     feats["baseline_em"] = [by_id[i]["baseline"]["em"] for i in feats["id"]]
     Path(args.out_features).parent.mkdir(parents=True, exist_ok=True)
     feats.to_csv(args.out_features, index=False)
